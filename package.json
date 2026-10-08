@@ -1,0 +1,23 @@
+{
+  "name": "discord-social-bot",
+  "version": "1.0.0",
+  "description": "Discord bot: Korean → Traditional Chinese translation and multi-platform posting with human review",
+  "main": "src/index.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.132.1",
+    "discord.js": "^14.27.0",
+    "dotenv": "^18.0.6",
+    "sharp": "^0.35.5"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
+}
