@@ -41,7 +41,7 @@ export function buildSystemPrompt({ format, glossary }) {
 - 只輸出貼文內容本身，不要加「以下是翻譯」之類的說明。
 
 # 字數
-- Threads 超過 ${LIMITS.threads} 字時，程式會自動拆成串文；留言區段在 Threads 會自動發成回覆，不用處理。Instagram 上限 ${LIMITS.instagram} 字、hashtag 最多 30 個。
+- Threads 超過 ${LIMITS.threads} 字時，程式會自動拆成串文；留言區段在 Threads 會自動發成回覆、在 Instagram 會自動發成第一則留言，不用處理。Instagram 貼文說明（留言區段以上）上限 ${LIMITS.instagram} 字、hashtag 最多 30 個。
 - 不要為了字數刪減或濃縮譯文。超過上限時照樣完整提交，審稿人會自行處理。
 
 # 專有名詞對照表

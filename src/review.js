@@ -1,5 +1,5 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from 'discord.js';
-import { LIMITS, PLATFORMS, PLATFORM_LABELS, checkPost, measure, threadParts } from './limits.js';
+import { LIMITS, LEGACY_LABELS, PLATFORMS, PLATFORM_LABELS, checkPost, measure, threadParts, instagramParts } from './limits.js';
 
 /**
  * The review message is the single source of truth for a draft: one embed holds
@@ -9,13 +9,15 @@ import { LIMITS, PLATFORMS, PLATFORM_LABELS, checkPost, measure, threadParts } f
 
 export const REACTIONS = {
   '✅': ['threads', 'instagram'],
-  '🧵': ['threads'],
+  '💬': ['threads'],
+  '🧵': ['threads'], // drafts posted before the emoji change
   '📷': ['instagram'],
 };
 export const DISCARD_REACTION = '❌';
-export const REACTION_ORDER = ['✅', '🧵', '📷', '❌'];
+export const ARCHIVE_REACTION = '📦';
+export const REACTION_ORDER = ['✅', '💬', '📷', '📦', '❌'];
 
-const COLORS = { post: 0x101010, meta: 0x5865f2 };
+const COLORS = { post: 0x101010, meta: 0x5865f2, done: 0x57f287 };
 const PENDING = '🕓 待審核';
 
 const POST_TAG = 'post';
@@ -25,6 +27,10 @@ export function postEmbed(text, status = {}) {
     const parts = p === 'threads' ? threadParts(text) : [];
     if (parts.length > 1) return `${PLATFORM_LABELS[p]} 主文＋${parts.length - 1} 則回覆`;
     const over = checkPost(p, text).length > 0;
+    if (p === 'instagram') {
+      const { caption, comment } = instagramParts(text);
+      return `${PLATFORM_LABELS[p]} ${over ? '⚠️ ' : ''}${measure(p, caption)}/${LIMITS[p]}${comment ? '＋留言' : ''}`;
+    }
     return `${PLATFORM_LABELS[p]} ${over ? '⚠️ ' : ''}${measure(p, text)}/${LIMITS[p]}`;
   });
   return new EmbedBuilder()
@@ -50,15 +56,16 @@ export function metaEmbed({ summary, notes, warnings, sourceUrl, inputMessageUrl
   if (warnings?.length) e.addFields({ name: '⚠️ 字數問題', value: warnings.join('\n').slice(0, 1024) });
   e.addFields({
     name: '操作方式',
-    value: '✅ 全部發布　🧵 只發 Threads　📷 只發 IG　❌ 捨棄\n要修改文字請按下方「編輯」。',
+    value: '✅ 全部發布　💬 只發 Threads　📷 只發 IG　📦 只搬到已發文、不發布　❌ 捨棄\n要修改文字請按下方「編輯」。',
   });
   return e;
 }
 
-export function draftButtons(disabled = false) {
+/** `allowEdit` keeps 編輯 usable on published drafts, so placeholders can be fixed before archiving. */
+export function draftButtons(disabled = false, { allowEdit = false } = {}) {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('draft:edit').setLabel('編輯').setEmoji('✏️').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
+      new ButtonBuilder().setCustomId('draft:edit').setLabel('編輯').setEmoji('✏️').setStyle(ButtonStyle.Secondary).setDisabled(disabled && !allowEdit),
       new ButtonBuilder().setCustomId('draft:regen').setLabel('重新生成').setEmoji('🔄').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
     ),
   ];
@@ -70,6 +77,22 @@ export function buildReviewPayload(posts, meta, files = []) {
     components: draftButtons(),
     files,
   };
+}
+
+/** The tidy record posted to the published channel once every platform is done. */
+export function buildArchivePayload(draft, files = []) {
+  const field = (n) => draft.meta?.fields.find((f) => f.name === n)?.value;
+  const record = new EmbedBuilder()
+    .setColor(COLORS.done)
+    .setTitle('✅ 已發文')
+    .setDescription(draft.meta?.description || '（無摘要）')
+    .addFields(
+      ...PLATFORMS.map((p) => ({ name: PLATFORM_LABELS[p], value: draft.status[p].slice(0, 1024), inline: false })),
+      { name: '原文連結', value: field('原文連結') || '（未提供）', inline: false },
+      { name: '提交者', value: field('提交者') || '—', inline: true },
+    );
+  const post = new EmbedBuilder().setColor(COLORS.post).setTitle('貼文內容').setDescription(draft.text || '（空白）');
+  return { embeds: [record, post], files, allowedMentions: { parse: [] } };
 }
 
 /** Read a draft back out of a review message. */
@@ -88,7 +111,8 @@ export function readDraft(message) {
     const desc = embed.description || '';
     draft.text = desc === '（空白）' ? '' : desc;
     for (const p of PLATFORMS) {
-      draft.status[p] = embed.fields.find((f) => f.name === PLATFORM_LABELS[p])?.value || PENDING;
+      const labels = [PLATFORM_LABELS[p], LEGACY_LABELS[p]];
+      draft.status[p] = embed.fields.find((f) => labels.includes(f.name))?.value || PENDING;
     }
   }
   draft.images = [...message.attachments.values()]

@@ -1,16 +1,18 @@
 import { publishThreads } from './threads.js';
 import { publishInstagram } from './instagram.js';
 import { getToken } from '../tokens.js';
-import { threadParts } from '../limits.js';
+import { threadParts, instagramParts } from '../limits.js';
 
 export async function publishTo(platform, { text, imageUrls }, cfg) {
   if (!cfg.enabled[platform]) {
     throw new Error('尚未設定這個平台的帳號金鑰（.env）');
   }
   if (cfg.dryRun) {
-    const parts = platform === 'threads' ? threadParts(text) : [text];
+    const ig = instagramParts(text);
+    const parts = platform === 'threads' ? threadParts(text) : [ig.caption, ig.comment].filter(Boolean);
     parts.forEach((part, i) => {
-      const label = parts.length > 1 ? ` (${i + 1}/${parts.length}${i ? ' 回覆' : ''})` : '';
+      const reply = platform === 'threads' ? ' 回覆' : ' 留言';
+      const label = parts.length > 1 ? ` (${i + 1}/${parts.length}${i ? reply : ''})` : '';
       console.log(`[DRY_RUN] ${platform}${label}\n${part}`);
     });
     console.log(`images: ${imageUrls.length}`);

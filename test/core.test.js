@@ -1,14 +1,14 @@
 import { test, mock, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseInput, isImageAttachment, isTextAttachment } from '../src/input.js';
-import { measure, checkPost, checkPosts, splitThreadText, threadParts } from '../src/limits.js';
+import { measure, checkPost, checkPosts, splitThreadText, threadParts, instagramParts, findPlaceholders } from '../src/limits.js';
 import { buildSystemPrompt, buildUserContent } from '../src/prompt.js';
-import { buildReviewPayload, readDraft, updateEmbeds, replaceMeta, metaEmbed, isPublished } from '../src/review.js';
+import { buildReviewPayload, buildArchivePayload, readDraft, updateEmbeds, replaceMeta, metaEmbed, isPublished } from '../src/review.js';
 import { loadStyle } from '../src/config.js';
 import { generatePosts } from '../src/ai.js';
 import { publishThreads } from '../src/publish/threads.js';
 import { publishInstagram } from '../src/publish/instagram.js';
-import { toJpeg, igAspectWarning } from '../src/media.js';
+import { toJpeg, igAspectWarning, padToIgRatio } from '../src/media.js';
 import sharp from 'sharp';
 
 afterEach(() => mock.restoreAll());
@@ -173,13 +173,74 @@ test('Instagram refuses text-only and surfaces API errors', async () => {
   await assert.rejects(publishInstagram({ text: 'x', imageUrls: ['https://a'] }, { userId: 'U', token: 'T' }), /Invalid token/);
 });
 
-test('images are converted to JPEG and ratio checked', async () => {
-  const png = await sharp({ create: { width: 2000, height: 500, channels: 3, background: '#f00' } }).png().toBuffer();
-  const out = await toJpeg(png);
+test('Instagram posts the comment section as the first comment', async () => {
+  const seen = [];
+  mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    const u = new URL(url);
+    const params = init.body ? Object.fromEntries(new URLSearchParams(init.body)) : Object.fromEntries(u.searchParams);
+    seen.push([u.pathname, params]);
+    if (u.pathname.endsWith('/media')) return jsonResponse({ id: 'c1' });
+    if (u.pathname.endsWith('/media_publish')) return jsonResponse({ id: 'post1' });
+    if (u.pathname.endsWith('/comments')) return jsonResponse({ id: 'cm1' });
+    if (params.fields === 'permalink') return jsonResponse({ permalink: 'https://instagram.com/p/1' });
+    return jsonResponse({ status_code: 'FINISHED' });
+  });
+  const text = '主文\n\n#許南俊\n\n— 留言區 —\n🔗 原文連結｜\nhttps://a.b';
+  const r = await publishInstagram({ text, imageUrls: ['https://a'] }, { userId: 'U', token: 'T' });
+  assert.equal(seen.find(([path]) => path.endsWith('/media'))[1].caption, '主文\n\n#許南俊');
+  const comment = seen.find(([path]) => path.endsWith('/comments'));
+  assert.equal(comment[0], '/v23.0/post1/comments');
+  assert.equal(comment[1].message, '🔗 原文連結｜\nhttps://a.b');
+  assert.equal(r.url, 'https://instagram.com/p/1');
+  assert.equal(r.warning, null);
+});
+
+test('instagramParts drops the marker and keeps text without one as caption', () => {
+  assert.deepEqual(instagramParts('甲\n— 留言區 —\n乙'), { caption: '甲', comment: '乙' });
+  assert.deepEqual(instagramParts('甲'), { caption: '甲', comment: '' });
+});
+
+test('images are converted to JPEG and padded into IG ratio', async () => {
+  const wide = await sharp({ create: { width: 2000, height: 500, channels: 3, background: '#f00' } }).png().toBuffer();
+  const out = await toJpeg(wide);
   assert.equal(out.width, 1440);
   assert.equal((await sharp(out.data).metadata()).format, 'jpeg');
-  assert.match(igAspectWarning(out, 0), /超出 IG 允許範圍/);
-  assert.equal(igAspectWarning({ width: 1080, height: 1350 }, 0), null);
+  assert.equal(igAspectWarning(out, 0), null);
+
+  const tall = await sharp({ create: { width: 1440, height: 2160, channels: 3, background: '#f00' } }).png().toBuffer();
+  const portrait = await toJpeg(tall);
+  assert.equal(igAspectWarning(portrait, 0), null);
+  assert.ok(Math.abs(portrait.width / portrait.height - 0.8) < 0.01);
+
+  assert.deepEqual(padToIgRatio({ width: 1080, height: 1350 }), { top: 0, bottom: 0, left: 0, right: 0 });
+  assert.deepEqual(padToIgRatio({ width: 1440, height: 2160 }), { top: 0, bottom: 0, left: 144, right: 144 });
+  assert.match(igAspectWarning({ width: 1440, height: 2160 }, 0), /超出 IG 允許範圍/);
+});
+
+test('archive payload carries summary, results, links and post text', () => {
+  const review = buildReviewPayload(
+    { summary: '新代言', post: '主文', notes: '', warnings: [] },
+    { sourceUrl: 'https://src', inputMessageUrl: 'https://discord.com/channels/1/2/3', submittedBy: '<@9>' },
+  );
+  const draft = readDraft({ embeds: review.embeds.map((e) => e.toJSON()), attachments: new Map() });
+  draft.status = { threads: '✅ 已發布 · [查看貼文](https://threads.net/p/1)', instagram: '✅ 已發布 · [查看貼文](https://instagram.com/p/1)' };
+  const { embeds } = buildArchivePayload(draft);
+  const [record, post] = embeds.map((e) => e.toJSON());
+  assert.equal(record.description, '新代言');
+  assert.match(record.fields.find((f) => f.name.includes('Threads')).value, /threads\.net/);
+  assert.equal(record.fields.find((f) => f.name === '原文連結').value, 'https://src');
+  assert.equal(post.description, '主文');
+});
+
+test('drafts posted with the old 🧵 label are still read', () => {
+  const old = { footer: { text: 'post' }, description: '主文', fields: [{ name: '🧵 Threads', value: '✅ 已發布' }] };
+  const draft = readDraft({ embeds: [old], attachments: new Map() });
+  assert.equal(draft.status.threads, '✅ 已發布');
+});
+
+test('placeholders that need a manual check are detected', () => {
+  assert.deepEqual(findPlaceholders('日期（待補）\n成員名待確認'), ['待確認', '待補']);
+  assert.deepEqual(findPlaceholders('正常內文'), []);
 });
 
 test('checkPosts aggregates', () => {

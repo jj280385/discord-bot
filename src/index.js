@@ -15,12 +15,14 @@ import { loadConfig, loadStyle } from './config.js';
 import { parseInput, isImageAttachment, isTextAttachment } from './input.js';
 import { generatePosts } from './ai.js';
 import { toJpeg, igAspectWarning, download } from './media.js';
-import { PLATFORMS, checkPost, checkPosts } from './limits.js';
+import { PLATFORMS, checkPost, checkPosts, findPlaceholders } from './limits.js';
 import {
   REACTIONS,
   DISCARD_REACTION,
+  ARCHIVE_REACTION,
   REACTION_ORDER,
   buildReviewPayload,
+  buildArchivePayload,
   readDraft,
   updateEmbeds,
   replaceMeta,
@@ -82,6 +84,8 @@ async function buildDraft(inputMessage) {
   const imageWarnings = images.map(igAspectWarning).filter(Boolean);
   if (imageAtts.length > MAX_IMAGES) imageWarnings.push(`只保留前 ${MAX_IMAGES} 張圖片`);
   if (images.length === 0) imageWarnings.push('沒有圖片：Instagram 無法發布純文字貼文');
+  const placeholders = findPlaceholders(posts.post);
+  if (placeholders.length) imageWarnings.push(`內文有「${placeholders.join('、')}」，需要人工確認，改掉之前不會發布或搬到已發文`);
   posts.warnings = [...posts.warnings, ...imageWarnings];
 
   return { posts, parsed, images };
@@ -100,7 +104,10 @@ async function handleInput(message) {
         files,
       ),
     );
-    for (const emoji of REACTION_ORDER) await review.react(emoji);
+    for (const emoji of REACTION_ORDER) {
+      if (emoji === ARCHIVE_REACTION && !cfg.publishedChannelId) continue;
+      await review.react(emoji);
+    }
     await message.reactions.cache.get('⏳')?.users.remove(client.user.id).catch(() => {});
     await message.react('✅').catch(() => {});
     await message.reply({ content: `草稿已送到待發文區：${review.url}`, allowedMentions: { repliedUser: false } });
@@ -134,8 +141,14 @@ async function handlePublish(message, platforms, userId) {
   try {
     const draft = readDraft(message);
     if (isDiscarded(draft)) return;
+    if (await blockIfPlaceholders(message, draft, userId)) return;
     const todo = platforms.filter((p) => !isPublished(draft.status[p]));
-    if (todo.length === 0) return;
+    if (todo.length === 0) {
+      // Drafts published before the published channel was set up: re-pressing
+      // the emoji moves them over without posting anything again.
+      if (cfg.publishedChannelId && PLATFORMS.every((p) => isPublished(draft.status[p]))) await archiveDraft(message);
+      return;
+    }
 
     const status = {};
     const ready = [];
@@ -170,10 +183,102 @@ async function handlePublish(message, platforms, userId) {
     const fresh = await message.fetch();
     const after = readDraft({ embeds: updateEmbeds(fresh, { status }).map((e) => e.toJSON()), attachments: new Map() });
     const allDone = PLATFORMS.every((p) => isPublished(after.status[p]));
-    await fresh.edit({ embeds: updateEmbeds(fresh, { status }), components: draftButtons(allDone) });
+    const edited = await fresh.edit({ embeds: updateEmbeds(fresh, { status }), components: draftButtons(allDone, { allowEdit: true }) });
+    if (allDone && cfg.publishedChannelId) {
+      try {
+        await archiveDraft(edited);
+        return;
+      } catch (err) {
+        console.error('[archive]', err);
+        summary.push(`⚠️ 無法整理到已發文頻道：${err.message}（草稿先保留在這裡）`);
+      }
+    }
     if (summary.length) {
       await fresh.reply({ content: `<@${userId}> 發布結果：\n${summary.join('\n')}`, allowedMentions: { users: [userId] } });
     }
+  } finally {
+    busy.delete(message.id);
+  }
+}
+
+/**
+ * Move a fully published draft to the published channel: the record (results,
+ * post text, images), then the original submission. Afterwards the draft, the
+ * original message and the bot's replies to it are deleted so only unfinished
+ * work stays in the input and review channels.
+ */
+async function archiveDraft(message) {
+  const draft = readDraft(message);
+  const files = [];
+  for (const [i, url] of draft.images.entries()) {
+    files.push(new AttachmentBuilder(await download(url), { name: `image-${i + 1}.jpg` }));
+  }
+  const input = await fetchInputMessage(draft.inputMessageUrl).catch(() => null);
+
+  const channel = await client.channels.fetch(cfg.publishedChannelId);
+  const record = await channel.send(buildArchivePayload(draft, files));
+  if (input) await record.reply(await originalPayload(input));
+
+  await deleteWithReplies(message);
+  if (input) await deleteWithReplies(input).catch((err) => console.error('[archive:input]', err));
+}
+
+/** The original submission as searchable text; long originals also go in a .txt file. */
+async function originalPayload(input) {
+  let text = input.content;
+  for (const att of [...input.attachments.values()].filter(isTextAttachment)) {
+    text += `\n${(await download(att.url)).toString('utf8')}`;
+  }
+  text = text.trim() || '（只有圖片）';
+  const header = `📄 原文（<@${input.author.id}> 提交於 <t:${Math.floor(input.createdTimestamp / 1000)}:f>）\n`;
+  const fits = [...header + text].length <= 2000;
+  return {
+    content: fits ? header + text : `${header}${[...text].slice(0, 1500).join('')}…\n（全文見附檔）`,
+    files: fits ? [] : [new AttachmentBuilder(Buffer.from(text, 'utf8'), { name: '原文.txt' })],
+    allowedMentions: { parse: [] },
+  };
+}
+
+/** Delete a message together with the bot's replies to it (e.g. earlier publish results). */
+async function deleteWithReplies(message) {
+  const later = await message.channel.messages.fetch({ after: message.id, limit: 100 });
+  const replies = later.filter((m) => m.author.id === client.user.id && m.reference?.messageId === message.id);
+  for (const m of replies.values()) await m.delete().catch(() => {});
+  await message.delete();
+}
+
+/**
+ * Drafts still containing placeholders like 「待確認」 are neither published nor
+ * archived; the reviewer is told to check them by hand instead.
+ */
+async function blockIfPlaceholders(message, draft, userId) {
+  const words = findPlaceholders(draft.text);
+  if (words.length === 0) return false;
+  const allDone = PLATFORMS.every((p) => isPublished(draft.status[p]));
+  await message.edit({ components: draftButtons(allDone, { allowEdit: true }) }).catch(() => {});
+  await message.reply({
+    content: `<@${userId}> 貼文裡還有「${words.join('、')}」，需要人工確認。請按「✏️ 編輯」修改後再按一次 emoji（這次沒有發布，也沒有搬到已發文）。`,
+    allowedMentions: { users: [userId] },
+  });
+  return true;
+}
+
+/** 📦: move the draft to the published channel without posting the remaining platforms. */
+async function handleArchiveOnly(message, userId) {
+  if (busy.has(message.id)) return;
+  busy.add(message.id);
+  try {
+    const draft = readDraft(message);
+    if (await blockIfPlaceholders(message, draft, userId)) return;
+    const status = {};
+    for (const p of PLATFORMS) {
+      if (!isPublished(draft.status[p])) status[p] = `📦 未發布（只搬到已發文）${stamp(userId)}`;
+    }
+    const edited = await message.edit({ embeds: updateEmbeds(message, { status }) });
+    await archiveDraft(edited);
+  } catch (err) {
+    console.error('[archive]', err);
+    await message.reply({ content: `<@${userId}> 無法搬到已發文頻道：${err.message}`, allowedMentions: { users: [userId] } }).catch(() => {});
   } finally {
     busy.delete(message.id);
   }
@@ -194,12 +299,14 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (!isDraftMessage(message)) return;
 
     const emoji = reaction.emoji.name;
-    if (!REACTIONS[emoji] && emoji !== DISCARD_REACTION) return;
+    if (!REACTIONS[emoji] && emoji !== DISCARD_REACTION && emoji !== ARCHIVE_REACTION) return;
+    if (emoji === ARCHIVE_REACTION && !cfg.publishedChannelId) return;
     if (!(await isReviewer(message.guild, user.id))) {
       await reaction.users.remove(user.id).catch(() => {});
       return;
     }
     if (emoji === DISCARD_REACTION) await handleDiscard(message, user.id);
+    else if (emoji === ARCHIVE_REACTION) await handleArchiveOnly(message, user.id);
     else await handlePublish(message, REACTIONS[emoji], user.id);
   } catch (err) {
     console.error('[reaction]', err);
