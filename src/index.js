@@ -84,6 +84,9 @@ async function buildDraft(inputMessage) {
   const imageWarnings = images.map(igAspectWarning).filter(Boolean);
   if (imageAtts.length > MAX_IMAGES) imageWarnings.push(`只保留前 ${MAX_IMAGES} 張圖片`);
   if (images.length === 0) imageWarnings.push('沒有圖片：Instagram 無法發布純文字貼文');
+  // Markers the submitter typed (「待確認」…) must survive translation so the draft stays blocked.
+  const typed = findPlaceholders(text).filter((w) => !posts.post.includes(w));
+  if (typed.length) posts.post = `【${typed.join('、')}：提交者標記，請確認後刪除這行】\n${posts.post}`;
   const placeholders = findPlaceholders(posts.post);
   if (placeholders.length) imageWarnings.push(`內文有「${placeholders.join('、')}」，需要人工確認，改掉之前不會發布或搬到已發文`);
   posts.warnings = [...posts.warnings, ...imageWarnings];

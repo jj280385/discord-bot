@@ -1,4 +1,4 @@
-import { LIMITS } from './limits.js';
+import { LIMITS, PLACEHOLDER_WORDS } from './limits.js';
 
 export const POST_TOOL = {
   name: 'submit_posts',
@@ -39,6 +39,12 @@ export function buildSystemPrompt({ format, glossary }) {
 - 人名、團名、節目名優先使用下方對照表；對照表沒有的專有名詞保留官方英文名或常見譯名，不確定就寫在 notes。
 - 如果原文附有圖片，圖片中的韓文也要一併翻譯。
 - 只輸出貼文內容本身，不要加「以下是翻譯」之類的說明。
+
+# 提交者的中文備註
+提交者可能在原文前後用中文加上備註，這些不是原文，不要翻譯成內文：
+- 「標題：…」：直接當作標題列使用（照抄，不要改寫）。
+- 「Cr. …」或「Cr：…」：直接當作 Cr. 那一行使用。
+- ${PLACEHOLDER_WORDS.map((w) => `「${w}」`).join('')}：代表提交者還不確定的地方。務必把這幾個字原封不動保留在貼文裡相對應的位置（例如「待確認：日期」→ 譯文中對應處寫「（待確認：日期）」），並寫進 notes。
 
 # 字數
 - Threads 超過 ${LIMITS.threads} 字時，程式會自動拆成串文；留言區段在 Threads 會自動發成回覆、在 Instagram 會自動發成第一則留言，不用處理。Instagram 貼文說明（留言區段以上）上限 ${LIMITS.instagram} 字、hashtag 最多 30 個。

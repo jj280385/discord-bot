@@ -94,7 +94,7 @@ export function instagramParts(text = '') {
 }
 
 // Words that mean a person still has to check something before it goes out.
-export const PLACEHOLDER_WORDS = ['待確認', '待補', '待查'];
+export const PLACEHOLDER_WORDS = ['待確認', '確認中', '待審查', '待補', '待查'];
 
 /** Placeholder words found in the post (empty if none). */
 export function findPlaceholders(text = '') {
