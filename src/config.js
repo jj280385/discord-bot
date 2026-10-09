@@ -18,6 +18,7 @@ export function loadConfig() {
     discordToken: required('DISCORD_TOKEN'),
     inputChannelId: required('INPUT_CHANNEL_ID'),
     reviewChannelId: required('REVIEW_CHANNEL_ID'),
+    publishedChannelId: optional('PUBLISHED_CHANNEL_ID'),
     reviewerRoleIds: list('REVIEWER_ROLE_IDS'),
     anthropicKey: required('ANTHROPIC_API_KEY'),
     model: optional('CLAUDE_MODEL') || 'claude-sonnet-5-5',
