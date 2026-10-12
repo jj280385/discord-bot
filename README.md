@@ -110,6 +110,16 @@ npm test                 # 單元測試
 
 其他可以跑 Docker 或 Node.js 20+ 的主機也都可以（`npm start` 或 `docker build` + `docker run -v ./data:/app/data --env-file .env`）。
 
+### 更新（自己的主機＋Docker）
+
+程式碼、`config/` 或主機上的 `.env` 有改動時，推上 GitHub 後 SSH 進主機執行：
+
+```
+~/discord-bot/deploy.sh
+```
+
+它會 `git pull` → 重新 build 映像檔 → 換成新容器（機器人離線幾秒）→ 印出最新 log，看到「已登入」就完成了。`data/`（自動續期的 token）放在容器外面，換容器不會不見。
+
 ---
 
 ## 目前的限制
