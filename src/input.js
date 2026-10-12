@@ -31,6 +31,14 @@ export function isImageAttachment(att) {
   return /\.(jpe?g|png|webp|gif|heic|heif)$/i.test(att.name || '');
 }
 
+const VIDEO_TYPES = /^video\/(mp4|quicktime)/i;
+
+/** Threads and Instagram both accept MP4 and MOV. */
+export function isVideoAttachment(att) {
+  if (att.contentType) return VIDEO_TYPES.test(att.contentType);
+  return /\.(mp4|mov)$/i.test(att.name || '');
+}
+
 /** Discord turns long pastes into a "message.txt" attachment. */
 export function isTextAttachment(att) {
   if (att.contentType) return att.contentType.startsWith('text/plain');

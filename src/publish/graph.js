@@ -23,6 +23,10 @@ export async function graphRequest(method, url, params = {}) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Meta needs minutes, not seconds, to process video. */
+export const waitOptions = (media) =>
+  media.some((m) => m.type === 'video') ? { timeoutMs: 10 * 60_000, intervalMs: 10_000 } : {};
+
 /**
  * Poll a media container until it is ready to publish.
  * @param {() => Promise<string>} getStatus returns FINISHED / IN_PROGRESS / ERROR / EXPIRED
