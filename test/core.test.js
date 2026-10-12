@@ -1,6 +1,6 @@
 import { test, mock, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseInput, isImageAttachment, isTextAttachment } from '../src/input.js';
+import { parseInput, isImageAttachment, isVideoAttachment, isTextAttachment } from '../src/input.js';
 import { measure, checkPost, checkPosts, splitThreadText, threadParts, instagramParts, findPlaceholders } from '../src/limits.js';
 import { buildSystemPrompt, buildUserContent } from '../src/prompt.js';
 import { buildReviewPayload, buildArchivePayload, readDraft, updateEmbeds, replaceMeta, metaEmbed, isPublished } from '../src/review.js';
@@ -23,6 +23,10 @@ test('parseInput splits link and text', () => {
 test('attachment type detection', () => {
   assert.ok(isImageAttachment({ contentType: 'image/png' }));
   assert.ok(!isImageAttachment({ contentType: 'video/mp4' }));
+  assert.ok(isVideoAttachment({ contentType: 'video/mp4' }));
+  assert.ok(isVideoAttachment({ contentType: 'video/quicktime' }));
+  assert.ok(isVideoAttachment({ name: 'clip.MOV' }));
+  assert.ok(!isVideoAttachment({ contentType: 'video/webm' }));
   assert.ok(isTextAttachment({ contentType: 'text/plain; charset=utf-8', name: 'message.txt' }));
 });
 
@@ -54,14 +58,21 @@ test('review message round-trips through embeds', () => {
   const payload = buildReviewPayload(posts, { sourceUrl: 'https://src', inputMessageUrl: 'https://discord.com/channels/1/2/3', submittedBy: '<@9>' });
   const message = {
     embeds: payload.embeds.map((e) => e.toJSON()),
-    attachments: new Map([['a', { url: 'https://cdn/img.jpg', contentType: 'image/jpeg' }]]),
+    attachments: new Map([
+      ['a', { url: 'https://cdn/img.jpg', name: 'image-1.jpg', contentType: 'image/jpeg' }],
+      ['b', { url: 'https://cdn/v.mp4', name: 'video-2.mp4', contentType: 'video/mp4' }],
+      ['c', { url: 'https://cdn/x.txt', name: 'x.txt', contentType: 'text/plain' }],
+    ]),
   };
   const d = readDraft(message);
   assert.equal(payload.embeds.length, 2);
   assert.equal(d.text, '貼文');
   assert.equal(d.sourceUrl, 'https://src');
   assert.equal(d.inputMessageUrl, 'https://discord.com/channels/1/2/3');
-  assert.deepEqual(d.images, ['https://cdn/img.jpg']);
+  assert.deepEqual(d.media, [
+    { type: 'image', url: 'https://cdn/img.jpg', name: 'image-1.jpg' },
+    { type: 'video', url: 'https://cdn/v.mp4', name: 'video-2.mp4' },
+  ]);
 
   const updated = updateEmbeds(message, { status: { instagram: '✅ 已發布' }, text: '新貼文' });
   const d2 = readDraft({ embeds: updated.map((e) => e.toJSON()), attachments: new Map() });
@@ -73,6 +84,9 @@ test('review message round-trips through embeds', () => {
   const swapped = replaceMeta(updated, metaEmbed({ summary: '新摘要', sourceUrl: 'https://new', inputMessageUrl: 'u', submittedBy: 's' }));
   assert.equal(readDraft({ embeds: swapped.map((e) => e.toJSON()), attachments: new Map() }).sourceUrl, 'https://new');
 });
+
+const img = (url) => ({ type: 'image', url });
+const vid = (url) => ({ type: 'video', url });
 
 function jsonResponse(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -139,7 +153,7 @@ test('long Threads post continues as a reply chain', async () => {
     return jsonResponse({ status: 'FINISHED' });
   });
   const text = ['甲'.repeat(400), '乙'.repeat(400), '丙'.repeat(400)].join('\n\n');
-  const r = await publishThreads({ text, imageUrls: [] }, { userId: 'U', token: 'T' });
+  const r = await publishThreads({ text, media: [] }, { userId: 'U', token: 'T' });
   assert.equal(created.length, 3);
   assert.equal(created[0].reply_to_id, undefined);
   assert.equal(created[1].reply_to_id, 'post1');
@@ -160,7 +174,7 @@ test('Threads carousel flow: children → carousel → publish', async () => {
     if (params.fields === 'permalink') return jsonResponse({ permalink: 'https://threads.net/p/1' });
     return jsonResponse({ status: 'FINISHED' });
   });
-  const r = await publishThreads({ text: 'hi', imageUrls: ['https://a', 'https://b'] }, { userId: 'U', token: 'T' });
+  const r = await publishThreads({ text: 'hi', media: [img('https://a'), img('https://b')] }, { userId: 'U', token: 'T' });
   assert.equal(r.url, 'https://threads.net/p/1');
   const carousel = seen.find(([, , p]) => p.media_type === 'CAROUSEL');
   assert.equal(carousel[2].children, 'c1,c2');
@@ -168,9 +182,9 @@ test('Threads carousel flow: children → carousel → publish', async () => {
 });
 
 test('Instagram refuses text-only and surfaces API errors', async () => {
-  await assert.rejects(publishInstagram({ text: 'x', imageUrls: [] }, { userId: 'U', token: 'T' }), /至少需要一張圖片/);
+  await assert.rejects(publishInstagram({ text: 'x', media: [] }, { userId: 'U', token: 'T' }), /至少需要一張圖片/);
   mock.method(globalThis, 'fetch', async () => jsonResponse({ error: { message: 'Invalid token' } }, 400));
-  await assert.rejects(publishInstagram({ text: 'x', imageUrls: ['https://a'] }, { userId: 'U', token: 'T' }), /Invalid token/);
+  await assert.rejects(publishInstagram({ text: 'x', media: [img('https://a')] }, { userId: 'U', token: 'T' }), /Invalid token/);
 });
 
 test('Instagram posts the comment section as the first comment', async () => {
@@ -186,7 +200,7 @@ test('Instagram posts the comment section as the first comment', async () => {
     return jsonResponse({ status_code: 'FINISHED' });
   });
   const text = '主文\n\n#許南俊\n\n— 留言區 —\n🔗 原文連結｜\nhttps://a.b';
-  const r = await publishInstagram({ text, imageUrls: ['https://a'] }, { userId: 'U', token: 'T' });
+  const r = await publishInstagram({ text, media: [img('https://a')] }, { userId: 'U', token: 'T' });
   assert.equal(seen.find(([path]) => path.endsWith('/media'))[1].caption, '主文\n\n#許南俊');
   const comment = seen.find(([path]) => path.endsWith('/comments'));
   assert.equal(comment[0], '/v23.0/post1/comments');
@@ -247,4 +261,70 @@ test('checkPosts aggregates', () => {
   assert.equal(checkPosts('').length, 2);
   assert.equal(checkPosts('中'.repeat(600)).length, 0);
   assert.equal(checkPosts('中'.repeat(2300)).length, 1);
+});
+
+/** Mock Meta: record every POST, answer container status checks with FINISHED. */
+function mockMeta(statusField) {
+  const posts = [];
+  let n = 0;
+  mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    const u = new URL(url);
+    if (init.body) {
+      const params = Object.fromEntries(new URLSearchParams(init.body));
+      posts.push([u.pathname, params]);
+      return jsonResponse({ id: /publish$/.test(u.pathname) ? 'post1' : `c${++n}` });
+    }
+    if (u.searchParams.get('fields') === 'permalink') return jsonResponse({ permalink: 'https://p/1' });
+    return jsonResponse({ [statusField]: 'FINISHED' });
+  });
+  return posts;
+}
+
+test('Threads posts a single video and mixes video into carousels', async () => {
+  let posts = mockMeta('status');
+  await publishThreads({ text: 'hi', media: [vid('https://v')] }, { userId: 'U', token: 'T' });
+  assert.deepEqual(posts[0][1], { media_type: 'VIDEO', video_url: 'https://v', text: 'hi', access_token: 'T' });
+
+  mock.restoreAll();
+  posts = mockMeta('status');
+  await publishThreads({ text: 'hi', media: [img('https://a'), vid('https://v')] }, { userId: 'U', token: 'T' });
+  assert.equal(posts[0][1].media_type, 'IMAGE');
+  assert.deepEqual([posts[1][1].media_type, posts[1][1].video_url, posts[1][1].is_carousel_item], ['VIDEO', 'https://v', 'true']);
+  assert.equal(posts[2][1].media_type, 'CAROUSEL');
+});
+
+test('Instagram posts a single video as a Reel and video carousel items as VIDEO', async () => {
+  let posts = mockMeta('status_code');
+  await publishInstagram({ text: 'hi', media: [vid('https://v')] }, { userId: 'U', token: 'T' });
+  const reel = posts.find(([path]) => path.endsWith('/media'))[1];
+  assert.deepEqual([reel.media_type, reel.video_url, reel.caption], ['REELS', 'https://v', 'hi']);
+
+  mock.restoreAll();
+  posts = mockMeta('status_code');
+  await publishInstagram({ text: 'hi', media: [vid('https://v'), img('https://a')] }, { userId: 'U', token: 'T' });
+  const [video, image, carousel] = posts.filter(([path]) => path.endsWith('/media')).map(([, p]) => p);
+  assert.deepEqual([video.media_type, video.video_url, video.is_carousel_item], ['VIDEO', 'https://v', 'true']);
+  assert.deepEqual([image.media_type, image.image_url], [undefined, 'https://a']);
+  assert.equal(carousel.children, 'c1,c2');
+});
+
+test('Instagram surfaces why Meta could not process a video', async () => {
+  mock.method(globalThis, 'fetch', async (url, init = {}) => {
+    if (init.body) return jsonResponse({ id: 'c1' });
+    return jsonResponse({ status_code: 'ERROR', status: 'ERROR: video codec not supported' });
+  });
+  await assert.rejects(
+    publishInstagram({ text: 'hi', media: [vid('https://v')] }, { userId: 'U', token: 'T' }),
+    /媒體處理失敗：ERROR: video codec not supported/,
+  );
+});
+
+test('videos left on the original message round-trip through the draft', () => {
+  const videoRefs = [{ pos: 1, name: 'clip（1）.mp4', id: '123' }, { pos: 3, name: 'b.mov', id: '456' }];
+  const payload = buildReviewPayload(posts, { sourceUrl: 'https://src', inputMessageUrl: 'u', submittedBy: 's', videoRefs });
+  const d = readDraft({ embeds: payload.embeds.map((e) => e.toJSON()), attachments: new Map() });
+  assert.deepEqual(d.videoRefs, videoRefs);
+  assert.deepEqual(readDraft({ embeds: buildReviewPayload(posts, { inputMessageUrl: 'u', submittedBy: 's' }).embeds.map((e) => e.toJSON()), attachments: new Map() }).videoRefs, []);
+  const archived = buildArchivePayload({ ...d, status: { threads: '✅', instagram: '✅' } }).embeds[0].toJSON();
+  assert.ok(archived.fields.some((f) => f.name === '🎬 影片'));
 });

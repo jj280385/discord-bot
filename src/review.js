@@ -41,7 +41,14 @@ export function postEmbed(text, status = {}) {
     .setFooter({ text: POST_TAG });
 }
 
-export function metaEmbed({ summary, notes, warnings, sourceUrl, inputMessageUrl, submittedBy }) {
+/**
+ * Videos too large for the bot to copy into the draft stay on the original
+ * message; this field records where they go in the post and which attachment they are.
+ */
+const VIDEO_REFS = '🎬 影片在原始訊息';
+const VIDEO_REF_RE = /第 (\d+) 個：(.+)（id (\d+)）/g;
+
+export function metaEmbed({ summary, notes, warnings, sourceUrl, inputMessageUrl, submittedBy, videoRefs }) {
   const e = new EmbedBuilder()
     .setColor(COLORS.meta)
     .setTitle('📝 待發文草稿')
@@ -52,6 +59,10 @@ export function metaEmbed({ summary, notes, warnings, sourceUrl, inputMessageUrl
       { name: '提交者', value: submittedBy, inline: true },
     )
     .setFooter({ text: 'meta' });
+  if (videoRefs?.length) {
+    const list = videoRefs.map((r) => `第 ${r.pos + 1} 個：${r.name}（id ${r.id}）`).join('\n');
+    e.addFields({ name: VIDEO_REFS, value: `超過 Discord 上傳上限，發布時直接用原始訊息裡的影片，**發布前請不要刪掉原始訊息**。\n${list}`.slice(0, 1024) });
+  }
   if (notes) e.addFields({ name: '🔎 請確認', value: notes.slice(0, 1024) });
   if (warnings?.length) e.addFields({ name: '⚠️ 字數問題', value: warnings.join('\n').slice(0, 1024) });
   e.addFields({
@@ -91,13 +102,14 @@ export function buildArchivePayload(draft, files = []) {
       { name: '原文連結', value: field('原文連結') || '（未提供）', inline: false },
       { name: '提交者', value: field('提交者') || '—', inline: true },
     );
+  if (draft.videoRefs?.length) record.addFields({ name: '🎬 影片', value: '檔案超過 Discord 上傳上限，這裡沒有保留，請到貼文連結觀看。' });
   const post = new EmbedBuilder().setColor(COLORS.post).setTitle('貼文內容').setDescription(draft.text || '（空白）');
   return { embeds: [record, post], files, allowedMentions: { parse: [] } };
 }
 
 /** Read a draft back out of a review message. */
 export function readDraft(message) {
-  const draft = { text: '', status: {}, meta: null, images: [] };
+  const draft = { text: '', status: {}, meta: null, media: [], videoRefs: [] };
   for (const embed of message.embeds) {
     const tag = embed.footer?.text || '';
     if (tag === 'meta') {
@@ -105,6 +117,7 @@ export function readDraft(message) {
       const field = (n) => embed.fields.find((f) => f.name === n)?.value;
       draft.sourceUrl = field('原文連結');
       draft.inputMessageUrl = field('原始訊息');
+      draft.videoRefs = [...(field(VIDEO_REFS) || '').matchAll(VIDEO_REF_RE)].map(([, pos, name, id]) => ({ pos: pos - 1, name, id }));
       continue;
     }
     if (tag !== POST_TAG) continue;
@@ -115,9 +128,13 @@ export function readDraft(message) {
       draft.status[p] = embed.fields.find((f) => labels.includes(f.name))?.value || PENDING;
     }
   }
-  draft.images = [...message.attachments.values()]
-    .filter((a) => (a.contentType || '').startsWith('image/'))
-    .map((a) => a.url);
+  // Attachment order is the posting order, with images and videos mixed.
+  draft.media = [...message.attachments.values()]
+    .map((a) => {
+      const type = (a.contentType || '').split('/')[0];
+      return type === 'image' || type === 'video' ? { type, url: a.url, name: a.name } : null;
+    })
+    .filter(Boolean);
   return draft;
 }
 

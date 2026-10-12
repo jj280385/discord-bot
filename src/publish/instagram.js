@@ -1,30 +1,36 @@
-import { graphRequest, waitUntilReady } from './graph.js';
+import { graphRequest, waitUntilReady, waitOptions } from './graph.js';
 import { instagramParts } from '../limits.js';
 
 // Instagram API with Instagram Login (no Facebook Page required).
 const HOST = 'https://graph.instagram.com/v23.0';
 
 /** The comment section is posted as the first comment under the post. */
-export async function publishInstagram({ text, imageUrls }, { userId, token }) {
-  if (imageUrls.length === 0) {
-    throw new Error('Instagram 不能發純文字貼文，至少需要一張圖片');
+export async function publishInstagram({ text, media }, { userId, token }) {
+  if (media.length === 0) {
+    throw new Error('Instagram 不能發純文字貼文，至少需要一張圖片或一支影片');
   }
   const { caption, comment } = instagramParts(text);
   const base = `${HOST}/${userId}`;
   const create = (params) => graphRequest('POST', `${base}/media`, { ...params, access_token: token });
+  const wait = waitOptions(media);
   const ready = (id) =>
     waitUntilReady(async () => {
-      const r = await graphRequest('GET', `${HOST}/${id}`, { fields: 'status_code', access_token: token });
+      const r = await graphRequest('GET', `${HOST}/${id}`, { fields: 'status_code,status', access_token: token });
+      if (r.status_code === 'ERROR' && r.status) throw new Error(`媒體處理失敗：${r.status}`);
       return r.status_code;
-    });
+    }, wait);
 
   let creationId;
-  if (imageUrls.length === 1) {
-    ({ id: creationId } = await create({ image_url: imageUrls[0], caption }));
+  if (media.length === 1) {
+    // A single video can only be published as a Reel.
+    const [m] = media;
+    const params = m.type === 'video' ? { media_type: 'REELS', video_url: m.url } : { image_url: m.url };
+    ({ id: creationId } = await create({ ...params, caption }));
   } else {
     const children = [];
-    for (const url of imageUrls.slice(0, 10)) {
-      const { id } = await create({ image_url: url, is_carousel_item: 'true' });
+    for (const m of media.slice(0, 10)) {
+      const params = m.type === 'video' ? { media_type: 'VIDEO', video_url: m.url } : { image_url: m.url };
+      const { id } = await create({ ...params, is_carousel_item: 'true' });
       children.push(id);
     }
     await Promise.all(children.map(ready));

@@ -12,7 +12,7 @@ import {
   TextInputStyle,
 } from 'discord.js';
 import { loadConfig, loadStyle } from './config.js';
-import { parseInput, isImageAttachment, isTextAttachment } from './input.js';
+import { parseInput, isImageAttachment, isVideoAttachment, isTextAttachment } from './input.js';
 import { generatePosts } from './ai.js';
 import { toJpeg, igAspectWarning, download } from './media.js';
 import { PLATFORMS, checkPost, checkPosts, findPlaceholders } from './limits.js';
@@ -48,7 +48,7 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-const MAX_IMAGES = 10;
+const MAX_MEDIA = 10; // Instagram carousel limit
 const busy = new Set();
 
 class UserError extends Error {}
@@ -65,14 +65,22 @@ async function buildDraft(inputMessage) {
   }
   text = text.trim();
 
-  const imageAtts = attachments.filter(isImageAttachment);
-  const images = [];
-  for (const att of imageAtts.slice(0, MAX_IMAGES)) {
-    images.push(await toJpeg(await download(att.url)));
+  // Videos are only downloaded when the draft is posted (handleInput); regenerating
+  // a draft just needs the text and images for Claude.
+  const mediaAtts = attachments.filter((a) => isImageAttachment(a) || isVideoAttachment(a));
+  const media = [];
+  for (const att of mediaAtts.slice(0, MAX_MEDIA)) {
+    if (isVideoAttachment(att)) media.push({ type: 'video', att });
+    else media.push({ type: 'image', ...(await toJpeg(await download(att.url))) });
   }
+  const images = media.filter((m) => m.type === 'image');
 
   if (!text && images.length === 0) {
-    throw new UserError('請貼上韓文原文和原文連結（也可以附上圖片）。');
+    throw new UserError(
+      media.length
+        ? 'Claude 看不到影片內容，請一起貼上韓文原文（或附上截圖）。'
+        : '請貼上韓文原文和原文連結（也可以附上圖片或影片）。',
+    );
   }
 
   const { format, glossary } = loadStyle(cfg.root);
@@ -82,8 +90,8 @@ async function buildDraft(inputMessage) {
   );
 
   const imageWarnings = images.map(igAspectWarning).filter(Boolean);
-  if (imageAtts.length > MAX_IMAGES) imageWarnings.push(`只保留前 ${MAX_IMAGES} 張圖片`);
-  if (images.length === 0) imageWarnings.push('沒有圖片：Instagram 無法發布純文字貼文');
+  if (mediaAtts.length > MAX_MEDIA) imageWarnings.push(`只保留前 ${MAX_MEDIA} 個圖片／影片`);
+  if (media.length === 0) imageWarnings.push('沒有圖片或影片：Instagram 無法發布純文字貼文');
   // Markers the submitter typed (「待確認」…) must survive translation so the draft stays blocked.
   const typed = findPlaceholders(text).filter((w) => !posts.post.includes(w));
   if (typed.length) posts.post = `【${typed.join('、')}：提交者標記，請確認後刪除這行】\n${posts.post}`;
@@ -91,22 +99,51 @@ async function buildDraft(inputMessage) {
   if (placeholders.length) imageWarnings.push(`內文有「${placeholders.join('、')}」，需要人工確認，改掉之前不會發布或搬到已發文`);
   posts.warnings = [...posts.warnings, ...imageWarnings];
 
-  return { posts, parsed, images };
+  return { posts, parsed, media };
+}
+
+/** Discord rejects uploads over the server's size limit with this error code. */
+const TOO_LARGE = 40005;
+
+/** Draft attachments in posting order; videos keep their original file. */
+async function mediaFiles(media) {
+  const files = [];
+  for (const [i, m] of media.entries()) {
+    if (m.type === 'image') files.push(new AttachmentBuilder(m.data, { name: `image-${i + 1}.jpg` }));
+    else {
+      const ext = m.att.name?.match(/\.(mp4|mov)$/i)?.[0].toLowerCase() || '.mp4';
+      files.push(new AttachmentBuilder(await download(m.att.url), { name: `video-${i + 1}${ext}` }));
+    }
+  }
+  return files;
 }
 
 async function handleInput(message) {
   await message.react('⏳').catch(() => {});
   try {
-    const { posts, parsed, images } = await buildDraft(message);
+    const { posts, parsed, media } = await buildDraft(message);
     const reviewChannel = await client.channels.fetch(cfg.reviewChannelId);
-    const files = images.map((img, i) => new AttachmentBuilder(img.data, { name: `image-${i + 1}.jpg` }));
-    const review = await reviewChannel.send(
-      buildReviewPayload(
-        posts,
-        { sourceUrl: parsed.sourceUrl, inputMessageUrl: message.url, submittedBy: `<@${message.author.id}>` },
-        files,
-      ),
-    );
+    const send = async (items, videoRefs) =>
+      reviewChannel.send(
+        buildReviewPayload(
+          posts,
+          { sourceUrl: parsed.sourceUrl, inputMessageUrl: message.url, submittedBy: `<@${message.author.id}>`, videoRefs },
+          await mediaFiles(items),
+        ),
+      );
+    let review;
+    try {
+      review = await send(media);
+    } catch (err) {
+      if (err.code !== TOO_LARGE) throw err;
+      // The submitter (Nitro / boosted server) can upload more than the bot:
+      // leave the videos on the original message and post them from there.
+      const videoRefs = media.map((m, pos) => (m.type === 'video' ? { pos, name: m.att.name, id: m.att.id } : null)).filter(Boolean);
+      review = await send(media.filter((m) => m.type === 'image'), videoRefs).catch((e) => {
+        if (e.code === TOO_LARGE) throw new UserError('圖片加起來超過 Discord 的上傳上限，機器人無法放進待發文區。請減少圖片後再貼一次。');
+        throw e;
+      });
+    }
     for (const emoji of REACTION_ORDER) {
       if (emoji === ARCHIVE_REACTION && !cfg.publishedChannelId) continue;
       await review.react(emoji);
@@ -127,7 +164,10 @@ async function handleInput(message) {
 
 async function isReviewer(guild, userId) {
   if (cfg.reviewerRoleIds.length === 0) return true;
-  const member = await guild.members.fetch(userId).catch(() => null);
+  const member = await guild.members.fetch(userId).catch((err) => {
+    console.error(`[reviewer] 無法取得成員 ${userId}`, err);
+    return null;
+  });
   if (!member) return false;
   return (
     member.permissions.has(PermissionFlagsBits.Administrator) ||
@@ -163,10 +203,14 @@ async function handlePublish(message, platforms, userId) {
         ready.push(p);
       }
     }
-    await message.edit({ embeds: updateEmbeds(message, { status }) });
+    // Re-fetching signs the attachment URLs again: a cached message from a
+    // long-running bot carries links Discord has expired (~24h), which Meta can't download.
+    const fetched = await message.edit({ embeds: updateEmbeds(message, { status }) }).then((m) => m.fetch());
+    const media = draftMedia(readDraft(fetched));
+    media.catch(() => {}); // reported per platform below
 
     const results = await Promise.allSettled(
-      ready.map((p) => publishTo(p, { text: draft.text, imageUrls: draft.images }, cfg)),
+      ready.map(async (p) => publishTo(p, { text: draft.text, media: await media }, cfg)),
     );
     const summary = [];
     results.forEach((r, i) => {
@@ -204,17 +248,31 @@ async function handlePublish(message, platforms, userId) {
   }
 }
 
+/** The draft's media in posting order, with videos left on the original message slotted back in. */
+async function draftMedia(draft) {
+  if (draft.videoRefs.length === 0) return draft.media;
+  const input = await fetchInputMessage(draft.inputMessageUrl).catch(() => null);
+  if (!input) throw new UserError('找不到原始訊息，無法取得影片（原始訊息被刪掉了嗎？）');
+  const media = [...draft.media];
+  for (const ref of draft.videoRefs) {
+    const att = input.attachments.get(ref.id);
+    if (!att) throw new UserError(`原始訊息裡找不到影片 ${ref.name}`);
+    media.splice(ref.pos, 0, { type: 'video', url: att.url, name: att.name });
+  }
+  return media;
+}
+
 /**
  * Move a fully published draft to the published channel: the record (results,
- * post text, images), then the original submission. Afterwards the draft, the
+ * post text, images and videos), then the original submission. Afterwards the draft, the
  * original message and the bot's replies to it are deleted so only unfinished
  * work stays in the input and review channels.
  */
 async function archiveDraft(message) {
   const draft = readDraft(message);
   const files = [];
-  for (const [i, url] of draft.images.entries()) {
-    files.push(new AttachmentBuilder(await download(url), { name: `image-${i + 1}.jpg` }));
+  for (const m of draft.media) {
+    files.push(new AttachmentBuilder(await download(m.url), { name: m.name }));
   }
   const input = await fetchInputMessage(draft.inputMessageUrl).catch(() => null);
 
@@ -305,7 +363,13 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
     if (!REACTIONS[emoji] && emoji !== DISCARD_REACTION && emoji !== ARCHIVE_REACTION) return;
     if (emoji === ARCHIVE_REACTION && !cfg.publishedChannelId) return;
     if (!(await isReviewer(message.guild, user.id))) {
+      console.log(`[reaction] ${user.tag ?? user.id} 不是審稿人，已移除 ${emoji}`);
       await reaction.users.remove(user.id).catch(() => {});
+      // Without a note the emoji just bounces back and looks like the bot ignored it.
+      const note = await message
+        .reply({ content: `<@${user.id}> 只有審稿人可以按 emoji 操作草稿，請找管理員加上審稿人身分組。`, allowedMentions: { users: [user.id] } })
+        .catch(() => null);
+      if (note) setTimeout(() => note.delete().catch(() => {}), 15_000);
       return;
     }
     if (emoji === DISCARD_REACTION) await handleDiscard(message, user.id);
@@ -353,7 +417,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const { posts, parsed } = await buildDraft(input);
         const text = PLATFORMS.every((p) => isPublished(draft.status[p])) ? undefined : posts.post;
         const submittedBy = draft.meta.fields.find((f) => f.name === '提交者')?.value || '—';
-        const meta = metaEmbed({ ...posts, sourceUrl: parsed.sourceUrl, inputMessageUrl: input.url, submittedBy });
+        const meta = metaEmbed({ ...posts, sourceUrl: parsed.sourceUrl, inputMessageUrl: input.url, submittedBy, videoRefs: draft.videoRefs });
         await message.edit({ embeds: replaceMeta(updateEmbeds(message, { text }), meta) });
         return interaction.editReply('已重新生成（已發布的平台不會變動）。');
       }
